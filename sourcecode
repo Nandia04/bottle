@@ -1,0 +1,1131 @@
+#define BLYNK_TEMPLATE_ID "TMPL6cwiMliSh"
+#define BLYNK_TEMPLATE_NAME "bottle"
+#define BLYNK_AUTH_TOKEN "hOK9ShSuQPXodi4GgOObuOsjM7n-UbTX"
+
+// ================= Wi-Fi CONFIG =================
+const char* WIFI_SSID = "Zulkan";
+const char* WIFI_PASS = "01234567";
+
+// =====================================================
+// FACTORY TARE MODE
+// =====================================================
+// Анхны тохиргоо хийх үед 1 болгоод хоосон савтай upload хийнэ.
+// TARE OFFSET хадгалагдсаны дараа 0 болгоод дахин upload хийнэ.
+#define FACTORY_TARE_MODE 0
+
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <HTTPClient.h>
+#include <BlynkSimpleEsp32.h>
+
+#include <HX711_ADC.h>
+#include <Wire.h>
+#include <U8g2lib.h>
+#include <RTClib.h>
+#include <SPI.h>
+#include <SD.h>
+#include <math.h>
+#include <Adafruit_NeoPixel.h>
+#include <Preferences.h>
+
+// ================= OLED =================
+U8G2_SH1106_128X64_NONAME_1_HW_I2C display(U8G2_R0, U8X8_PIN_NONE);
+
+// ================= RTC =================
+RTC_DS3231 rtc;
+
+// ================= HX711 =================
+HX711_ADC LoadCell(4, 5);
+
+// ================= ESP32 MEMORY =================
+Preferences prefs;
+
+long savedTareOffset = 0;
+bool tareOffsetReady = false;
+
+// ================= NEOPIXEL =================
+#define NEOPIXEL_PIN        25
+#define NEOPIXEL_COUNT      35
+#define NEOPIXEL_BRIGHTNESS 18
+
+Adafruit_NeoPixel pixel(NEOPIXEL_COUNT, NEOPIXEL_PIN, NEO_GRB + NEO_KHZ800);
+
+// ================= BUZZER =================
+const int buzzerPin = 14;
+const int buzzerResolution = 8;
+
+// ================= SD CARD =================
+#define SD_CS    33
+#define SD_SCK   18
+#define SD_MISO  19
+#define SD_MOSI  23
+
+SPIClass sdSPI(VSPI);
+bool sdReady = false;
+
+// ================= BATTERY MONITOR =================
+#define BATTERY_MONITOR_ENABLED 0
+#define BATTERY_ADC_PIN 34
+#define VOLTAGE_DIVIDER_RATIO 2.0
+
+const float batteryLowVoltage = 3.30;
+bool batteryLowActive = false;
+unsigned long lastBatteryAlertTime = 0;
+const unsigned long batteryAlertInterval = 60000UL;
+
+// ================= Calibration =================
+float calibrationValue = 1050.0;
+
+// ================= USER =================
+float dailyGoal = 2000.0;
+
+// ================= Tracking =================
+float currentWeight = 0.0;
+float previousWeight = 0.0;
+float stableReference = 0.0;
+float lastDrink = 0.0;
+float totalDrink = 0.0;
+
+// ================= Motion Filter =================
+// Ширээ хөдөлсөн, сав доргисон үед ус уусан гэж андуурахаас хамгаална.
+float lastRawWeight = 0.0;
+unsigned long lastMotionTime = 0;
+
+const unsigned long motionQuietTime = 2500UL; 
+const float motionThreshold = 8.0;
+
+// ================= States =================
+bool bottleOnScale = false;
+bool waitingStable = false;
+bool reminderActive = false;
+bool drankConfirmed = false;
+bool dailyGoalNotified = false;
+bool bootWeightChecked = false;
+
+// ================= Timers =================
+unsigned long stableTimer = 0;
+unsigned long drinkLedStartTime = 0;
+unsigned long lastReminderTime = 0;
+unsigned long lastRepeatAlertTime = 0;
+unsigned long lastSyncAttempt = 0;
+
+const unsigned long reminderInterval    = 3UL * 60UL * 1000UL;
+const unsigned long repeatAlertInterval = 30000UL;
+
+// Өмнө 1500 байсан. Одоо доргилт багасгахын тулд 3000 болгосон.
+const unsigned long stableDelay         = 3000UL;
+
+const unsigned long drinkShowTime       = 3000UL;
+const unsigned long autoSyncInterval    = 60UL * 60UL * 1000UL;
+
+// ================= Wi-Fi Sync =================
+const unsigned long wifiConnectTimeout = 10000UL;
+const unsigned long blynkConnectTimeout = 5000UL;
+
+// ================= Thresholds =================
+const float liftThreshold      = 50.0;
+
+// Өмнө 5g байсан. Одоо ширээний хөдөлгөөнөөс хамгаалж 10g болгосон.
+const float drinkThreshold     = 10.0;
+
+const float maxDrinkThreshold  = 300.0;
+
+// Өмнө 2g байсан. Одоо 4g болгосон.
+const float stabilityThreshold = 4.0;
+
+const float bootWeightDifferenceThreshold = 5.0;
+
+// ================= Time =================
+int nextReminderHour = 0;
+int nextReminderMinute = 0;
+
+// ================= BLYNK CACHE =================
+float prevSentWeight = -9999.0;
+float prevSentLastDrink = -9999.0;
+float prevSentTotalDrink = -9999.0;
+float prevSentDailyGoal = -9999.0;
+int prevSentReminderActive = -1;
+int prevSentDrankConfirmed = -1;
+String prevSentNextTime = "";
+
+// =====================================================
+// STRING HELPERS
+// =====================================================
+String twoDigit(int v) {
+  if (v < 10) return "0" + String(v);
+  return String(v);
+}
+
+String getDateString(DateTime now) {
+  return String(now.year()) + "-" + twoDigit(now.month()) + "-" + twoDigit(now.day());
+}
+
+String getTimeString(DateTime now) {
+  return twoDigit(now.hour()) + ":" + twoDigit(now.minute()) + ":" + twoDigit(now.second());
+}
+
+uint64_t getEpochMillis(DateTime now) {
+  return (uint64_t)now.unixtime() * 1000ULL;
+}
+
+// =====================================================
+// MEMORY SAVE / LOAD
+// =====================================================
+void saveLastStableWeight(float w) {
+  prefs.putFloat("lastWeight", w);
+
+  Serial.print("Saved lastWeight: ");
+  Serial.print(w, 1);
+  Serial.println(" g");
+}
+
+float loadLastStableWeight() {
+  float w = prefs.getFloat("lastWeight", 0.0);
+
+  Serial.print("Loaded lastWeight: ");
+  Serial.print(w, 1);
+  Serial.println(" g");
+
+  return w;
+}
+
+void saveTareOffset(long offset) {
+  prefs.putLong("tareOffset", offset);
+
+  Serial.print("TARE OFFSET SAVED: ");
+  Serial.println(offset);
+}
+
+long loadTareOffset() {
+  long offset = prefs.getLong("tareOffset", 0);
+
+  Serial.print("Loaded tareOffset: ");
+  Serial.println(offset);
+
+  return offset;
+}
+
+// =====================================================
+// SD CARD
+// =====================================================
+void initSDCard() {
+  pinMode(SD_CS, OUTPUT);
+  digitalWrite(SD_CS, HIGH);
+
+  sdSPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
+
+  if (!SD.begin(SD_CS, sdSPI, 400000)) {
+    Serial.println("SD init FAILED");
+    sdReady = false;
+    return;
+  }
+
+  sdReady = true;
+  Serial.println("SD init OK");
+
+  if (!SD.exists("/pending.csv")) {
+    File file = SD.open("/pending.csv", FILE_WRITE);
+    if (file) {
+      file.println("epoch_ms,date,time,event,current_weight,last_drink,total_drink");
+      file.close();
+      Serial.println("pending.csv created");
+    }
+  }
+}
+
+void appendPendingLog(DateTime now, const String &eventType) {
+  if (!sdReady) return;
+
+  File file = SD.open("/pending.csv", FILE_APPEND);
+  if (!file) {
+    Serial.println("Failed to open pending.csv");
+    return;
+  }
+
+  file.print((unsigned long long)getEpochMillis(now));
+  file.print(",");
+  file.print(getDateString(now));
+  file.print(",");
+  file.print(getTimeString(now));
+  file.print(",");
+  file.print(eventType);
+  file.print(",");
+  file.print(currentWeight, 1);
+  file.print(",");
+  file.print(lastDrink, 1);
+  file.print(",");
+  file.println(totalDrink, 1);
+
+  file.close();
+
+  Serial.print("Saved to SD: ");
+  Serial.println(eventType);
+}
+
+// =====================================================
+// NEOPIXEL LED
+// =====================================================
+void setPixelColorRGB(uint8_t r, uint8_t g, uint8_t b) {
+  pixel.setBrightness(NEOPIXEL_BRIGHTNESS);
+
+  for (int i = 0; i < NEOPIXEL_COUNT; i++) {
+    pixel.setPixelColor(i, pixel.Color(r, g, b));
+  }
+
+  pixel.show();
+}
+
+void clearPixel() {
+  pixel.clear();
+  pixel.show();
+}
+
+void buzzerOff() {
+  ledcWriteTone(buzzerPin, 0);
+}
+
+void beepOnce(int freq = 2000, int durationMs = 150) {
+  ledcWriteTone(buzzerPin, freq);
+  delay(durationMs);
+  buzzerOff();
+}
+
+void flashLED(uint8_t r, uint8_t g, uint8_t b, int times, int onMs, int offMs, bool useBuzzer) {
+  for (int i = 0; i < times; i++) {
+    setPixelColorRGB(r, g, b);
+
+    if (useBuzzer) {
+      ledcWriteTone(buzzerPin, 2000);
+    }
+
+    delay(onMs);
+
+    clearPixel();
+    buzzerOff();
+
+    delay(offMs);
+  }
+}
+
+void startupLed() {
+  setPixelColorRGB(0, 255, 0);
+  delay(3000);
+  clearPixel();
+}
+
+void reminderAlert() {
+  flashLED(0, 0, 255, 5, 180, 180, true);
+}
+
+void drinkConfirmedLed() {
+  flashLED(0, 0, 255, 2, 180, 180, false);
+}
+
+void batteryLowAlert() {
+  flashLED(255, 0, 0, 3, 180, 300, true);
+}
+
+void syncSuccessLed() {
+  flashLED(0, 255, 0, 2, 150, 150, false);
+}
+
+void syncFailedLed() {
+  flashLED(255, 0, 0, 2, 150, 150, false);
+}
+
+void goalCompletedLed() {
+  flashLED(0, 255, 0, 3, 150, 150, true);
+}
+
+// =====================================================
+// BATTERY
+// =====================================================
+float readBatteryVoltage() {
+#if BATTERY_MONITOR_ENABLED
+  int raw = analogRead(BATTERY_ADC_PIN);
+  float adcVoltage = (raw / 4095.0) * 3.3;
+  float batteryVoltage = adcVoltage * VOLTAGE_DIVIDER_RATIO;
+  return batteryVoltage;
+#else
+  return 4.0;
+#endif
+}
+
+void checkBatteryLow() {
+#if BATTERY_MONITOR_ENABLED
+  float voltage = readBatteryVoltage();
+
+  if (voltage <= batteryLowVoltage) {
+    batteryLowActive = true;
+  } else {
+    batteryLowActive = false;
+  }
+
+  if (batteryLowActive && millis() - lastBatteryAlertTime >= batteryAlertInterval) {
+    Serial.print("LOW BATTERY: ");
+    Serial.println(voltage);
+    batteryLowAlert();
+    lastBatteryAlertTime = millis();
+  }
+#endif
+}
+
+// =====================================================
+// TIME
+// =====================================================
+void updateNextReminderTime(DateTime now) {
+  nextReminderHour = now.hour();
+  nextReminderMinute = now.minute() + 3;
+
+  if (nextReminderMinute >= 60) {
+    nextReminderMinute -= 60;
+    nextReminderHour++;
+  }
+
+  if (nextReminderHour >= 24) {
+    nextReminderHour = 0;
+  }
+}
+
+void printNextReminderToSerial() {
+  Serial.print("Next drink time: ");
+  if (nextReminderHour < 10) Serial.print("0");
+  Serial.print(nextReminderHour);
+  Serial.print(":");
+  if (nextReminderMinute < 10) Serial.print("0");
+  Serial.println(nextReminderMinute);
+}
+
+// =====================================================
+// DISPLAY
+// =====================================================
+void drawDisplay(DateTime now) {
+  display.firstPage();
+  do {
+    display.setFont(u8g2_font_6x10_tf);
+
+    display.setCursor(0, 10);
+    display.print("Water: ");
+    display.print(currentWeight, 1);
+    display.print(" g");
+
+    display.setCursor(0, 22);
+    display.print("Last: ");
+    display.print(lastDrink, 1);
+    display.print(" g");
+
+    display.setCursor(0, 34);
+    display.print("Total: ");
+    display.print(totalDrink, 1);
+    display.print(" g");
+
+    display.setCursor(0, 46);
+    display.print("Goal: ");
+    display.print(dailyGoal, 0);
+    display.print(" g");
+
+    display.setCursor(0, 58);
+    display.print("Now ");
+    if (now.hour() < 10) display.print("0");
+    display.print(now.hour());
+    display.print(":");
+    if (now.minute() < 10) display.print("0");
+    display.print(now.minute());
+
+    display.setCursor(70, 58);
+    display.print("N ");
+    if (nextReminderHour < 10) display.print("0");
+    display.print(nextReminderHour);
+    display.print(":");
+    if (nextReminderMinute < 10) display.print("0");
+    display.print(nextReminderMinute);
+
+  } while (display.nextPage());
+}
+
+// =====================================================
+// BLYNK SEND
+// =====================================================
+void sendToBlynkIfChanged(bool forceSend = false) {
+  if (WiFi.status() != WL_CONNECTED || !Blynk.connected()) return;
+
+  String nextTime = "";
+  if (nextReminderHour < 10) nextTime += "0";
+  nextTime += String(nextReminderHour);
+  nextTime += ":";
+  if (nextReminderMinute < 10) nextTime += "0";
+  nextTime += String(nextReminderMinute);
+
+  if (forceSend || fabs(currentWeight - prevSentWeight) > 1.0) {
+    Blynk.virtualWrite(V0, currentWeight);
+    prevSentWeight = currentWeight;
+  }
+
+  if (forceSend || fabs(lastDrink - prevSentLastDrink) > 0.1) {
+    Blynk.virtualWrite(V1, lastDrink);
+    prevSentLastDrink = lastDrink;
+  }
+
+  if (forceSend || fabs(totalDrink - prevSentTotalDrink) > 0.1) {
+    Blynk.virtualWrite(V2, totalDrink);
+    prevSentTotalDrink = totalDrink;
+  }
+
+  if (forceSend || fabs(dailyGoal - prevSentDailyGoal) > 0.1) {
+    Blynk.virtualWrite(V3, dailyGoal);
+    prevSentDailyGoal = dailyGoal;
+  }
+
+  int reminderState = reminderActive ? 1 : 0;
+  if (forceSend || reminderState != prevSentReminderActive) {
+    Blynk.virtualWrite(V4, reminderState);
+    prevSentReminderActive = reminderState;
+  }
+
+  int drankState = drankConfirmed ? 1 : 0;
+  if (forceSend || drankState != prevSentDrankConfirmed) {
+    Blynk.virtualWrite(V5, drankState);
+    prevSentDrankConfirmed = drankState;
+  }
+
+  if (forceSend || nextTime != prevSentNextTime) {
+    Blynk.virtualWrite(V6, nextTime);
+    prevSentNextTime = nextTime;
+  }
+}
+
+BLYNK_WRITE(V10) {
+  dailyGoal = param.asFloat();
+  sendToBlynkIfChanged(true);
+}
+
+// =====================================================
+// BLYNK HISTORY UPLOAD
+// =====================================================
+bool postHistoryArray(const String &pin, const String &jsonArray) {
+  WiFiClientSecure client;
+  client.setInsecure();
+
+  HTTPClient http;
+  String url = "https://blynk.cloud/external/api/batch/update?token=" + String(BLYNK_AUTH_TOKEN) + "&pin=" + pin;
+
+  http.begin(client, url);
+  http.addHeader("Content-Type", "application/json");
+
+  int httpCode = http.POST(jsonArray);
+  String response = http.getString();
+  http.end();
+
+  Serial.print("POST ");
+  Serial.print(pin);
+  Serial.print(" -> HTTP ");
+  Serial.println(httpCode);
+
+  if (httpCode >= 200 && httpCode < 300) {
+    return true;
+  }
+
+  Serial.println(response);
+  return false;
+}
+
+bool syncPendingToBlynk() {
+  if (!sdReady) return false;
+  if (WiFi.status() != WL_CONNECTED) return false;
+  if (!Blynk.connected()) return false;
+
+  File file = SD.open("/pending.csv", FILE_READ);
+  if (!file) {
+    Serial.println("No pending.csv to sync");
+    return false;
+  }
+
+  String header = file.readStringUntil('\n');
+
+  String jsonV0 = "[";
+  String jsonV1 = "[";
+  String jsonV2 = "[";
+
+  const int maxBatch = 20;
+  int count = 0;
+
+  while (file.available() && count < maxBatch) {
+    String line = file.readStringUntil('\n');
+    line.trim();
+    if (line.length() == 0) continue;
+
+    int p1 = line.indexOf(',');
+    int p2 = line.indexOf(',', p1 + 1);
+    int p3 = line.indexOf(',', p2 + 1);
+    int p4 = line.indexOf(',', p3 + 1);
+    int p5 = line.indexOf(',', p4 + 1);
+    int p6 = line.indexOf(',', p5 + 1);
+
+    if (p1 < 0 || p2 < 0 || p3 < 0 || p4 < 0 || p5 < 0 || p6 < 0) continue;
+
+    String epochMsStr       = line.substring(0, p1);
+    String currentWeightStr = line.substring(p4 + 1, p5);
+    String lastDrinkStr     = line.substring(p5 + 1, p6);
+    String totalDrinkStr    = line.substring(p6 + 1);
+
+    if (count > 0) {
+      jsonV0 += ",";
+      jsonV1 += ",";
+      jsonV2 += ",";
+    }
+
+    jsonV0 += "[" + epochMsStr + "," + currentWeightStr + "]";
+    jsonV1 += "[" + epochMsStr + "," + lastDrinkStr + "]";
+    jsonV2 += "[" + epochMsStr + "," + totalDrinkStr + "]";
+
+    count++;
+  }
+
+  file.close();
+
+  if (count == 0) {
+    Serial.println("No pending rows to sync");
+    return false;
+  }
+
+  jsonV0 += "]";
+  jsonV1 += "]";
+  jsonV2 += "]";
+
+  bool ok0 = postHistoryArray("v0", jsonV0);
+  bool ok1 = postHistoryArray("v1", jsonV1);
+  bool ok2 = postHistoryArray("v2", jsonV2);
+
+  if (!(ok0 && ok1 && ok2)) {
+    Serial.println("Sync failed, pending data kept");
+    return false;
+  }
+
+  File inFile = SD.open("/pending.csv", FILE_READ);
+  if (!inFile) return false;
+
+  File outFile = SD.open("/temp.csv", FILE_WRITE);
+  if (!outFile) {
+    inFile.close();
+    return false;
+  }
+
+  String firstLine = inFile.readStringUntil('\n');
+  outFile.println(firstLine);
+
+  int skipped = 0;
+  while (inFile.available()) {
+    String line = inFile.readStringUntil('\n');
+    line.trim();
+    if (line.length() == 0) continue;
+
+    if (skipped < count) {
+      skipped++;
+      continue;
+    }
+
+    outFile.println(line);
+  }
+
+  inFile.close();
+  outFile.close();
+
+  SD.remove("/pending.csv");
+  SD.rename("/temp.csv", "/pending.csv");
+
+  Serial.print("Synced rows: ");
+  Serial.println(count);
+
+  return true;
+}
+
+void syncAllPendingToBlynk() {
+  if (!sdReady) return;
+  if (WiFi.status() != WL_CONNECTED) return;
+  if (!Blynk.connected()) return;
+
+  Serial.println("Syncing pending SD history to Blynk...");
+
+  int rounds = 0;
+  const int maxRounds = 200;
+
+  while (rounds < maxRounds) {
+    Blynk.run();
+
+    bool ok = syncPendingToBlynk();
+    if (!ok) break;
+
+    rounds++;
+    delay(300);
+  }
+
+  sendToBlynkIfChanged(true);
+
+  Serial.print("Sync rounds done: ");
+  Serial.println(rounds);
+}
+
+// =====================================================
+// WIFI CONTROL
+// =====================================================
+void wifiOff() {
+  if (Blynk.connected()) {
+    Blynk.disconnect();
+  }
+
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_OFF);
+  delay(100);
+  Serial.println("WiFi OFF");
+}
+
+bool connectWifi() {
+  if (String(WIFI_SSID).length() == 0 || String(WIFI_SSID) == "YOUR_WIFI_NAME") {
+    Serial.println("WiFi SSID not configured. Offline mode.");
+    return false;
+  }
+
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+
+  Serial.print("Connecting WiFi");
+
+  unsigned long startAttempt = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - startAttempt < wifiConnectTimeout) {
+    delay(250);
+    Serial.print(".");
+  }
+
+  Serial.println();
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("WiFi connected");
+    Serial.println(WiFi.localIP());
+    return true;
+  }
+
+  Serial.println("WiFi connect failed. System continues offline.");
+  return false;
+}
+
+bool connectBlynk() {
+  if (WiFi.status() != WL_CONNECTED) return false;
+
+  Blynk.config(BLYNK_AUTH_TOKEN);
+
+  unsigned long startAttempt = millis();
+  while (!Blynk.connected() && millis() - startAttempt < blynkConnectTimeout) {
+    Blynk.connect(500);
+    Blynk.run();
+    delay(100);
+  }
+
+  if (Blynk.connected()) {
+    Serial.println("Blynk connected");
+    return true;
+  }
+
+  Serial.println("Blynk connect failed. System continues offline.");
+  return false;
+}
+
+void syncNow() {
+  Serial.println("SYNC START");
+
+  bool wifiOK = connectWifi();
+  if (!wifiOK) {
+    syncFailedLed();
+    wifiOff();
+    return;
+  }
+
+  bool blynkOK = connectBlynk();
+  if (!blynkOK) {
+    syncFailedLed();
+    wifiOff();
+    return;
+  }
+
+  sendToBlynkIfChanged(true);
+  syncAllPendingToBlynk();
+
+  syncSuccessLed();
+  wifiOff();
+
+  Serial.println("SYNC DONE");
+}
+
+void tryAutoSync() {
+  if (millis() - lastSyncAttempt < autoSyncInterval) return;
+  lastSyncAttempt = millis();
+
+  syncNow();
+}
+
+// =====================================================
+// SAVE EVENT
+// =====================================================
+void saveEvent(DateTime now, const String &eventType) {
+  appendPendingLog(now, eventType);
+}
+
+// =====================================================
+// REMINDER
+// =====================================================
+void activateReminder(DateTime now) {
+  reminderActive = true;
+  drankConfirmed = false;
+
+  updateNextReminderTime(now);
+
+  Serial.println("TIME TO DRINK!");
+  printNextReminderToSerial();
+
+  reminderAlert();
+
+  saveEvent(now, "reminder");
+
+  lastRepeatAlertTime = millis();
+}
+
+// =====================================================
+// DRINK
+// =====================================================
+void confirmDrink(DateTime now, float drank) {
+  lastDrink = drank;
+  totalDrink += drank;
+
+  reminderActive = false;
+  drankConfirmed = true;
+  drinkLedStartTime = millis();
+  lastReminderTime = millis();
+  lastRepeatAlertTime = millis();
+
+  updateNextReminderTime(now);
+
+  Serial.print("Drank: ");
+  Serial.print(drank, 1);
+  Serial.println(" g");
+
+  printNextReminderToSerial();
+
+  drinkConfirmedLed();
+
+  saveEvent(now, "drink");
+
+  if (totalDrink >= dailyGoal && !dailyGoalNotified) {
+    dailyGoalNotified = true;
+    goalCompletedLed();
+    saveEvent(now, "goal_completed");
+  }
+}
+
+// =====================================================
+// BOOT WEIGHT LOGIC
+// =====================================================
+void handleBootStableWeight(float bootWeight) {
+  if (bootWeight < liftThreshold) {
+    previousWeight = 0.0;
+    saveLastStableWeight(0.0);
+
+    Serial.println("Boot: bottle not detected or empty.");
+    return;
+  }
+
+  if (previousWeight <= 0.0) {
+    previousWeight = bootWeight;
+    saveLastStableWeight(previousWeight);
+
+    Serial.print("Boot: first stable weight saved: ");
+    Serial.print(previousWeight, 1);
+    Serial.println(" g");
+    return;
+  }
+
+  float diff = bootWeight - previousWeight;
+
+  Serial.print("Boot current weight: ");
+  Serial.print(bootWeight, 1);
+  Serial.println(" g");
+
+  Serial.print("Boot saved weight: ");
+  Serial.print(previousWeight, 1);
+  Serial.println(" g");
+
+  Serial.print("Boot difference: ");
+  Serial.print(diff, 1);
+  Serial.println(" g");
+
+  previousWeight = bootWeight;
+  saveLastStableWeight(previousWeight);
+
+  if (fabs(diff) <= bootWeightDifferenceThreshold) {
+    Serial.println("Boot: same weight, continue.");
+  } else if (diff > bootWeightDifferenceThreshold) {
+    Serial.println("Boot: water added while off, reference updated.");
+  } else {
+    Serial.println("Boot: water reduced while off, reference updated without counting drink.");
+  }
+}
+
+// =====================================================
+// SETUP
+// =====================================================
+void setup() {
+  Serial.begin(115200);
+  Wire.begin(21, 22);
+
+  prefs.begin("bottle", false);
+
+  initSDCard();
+
+  if (!rtc.begin()) {
+    Serial.println("RTC NOT FOUND");
+  }
+
+  display.begin();
+
+  pixel.begin();
+  pixel.setBrightness(NEOPIXEL_BRIGHTNESS);
+  clearPixel();
+
+  pinMode(buzzerPin, OUTPUT);
+  ledcAttach(buzzerPin, 2000, buzzerResolution);
+  buzzerOff();
+
+#if BATTERY_MONITOR_ENABLED
+  analogReadResolution(12);
+  pinMode(BATTERY_ADC_PIN, INPUT);
+#endif
+
+  startupLed();
+
+  // ================= HX711 INIT =================
+  LoadCell.begin();
+
+#if FACTORY_TARE_MODE
+  Serial.println("FACTORY TARE MODE ENABLED");
+  Serial.println("Put EMPTY bottle on load cell.");
+  Serial.println("Taring...");
+
+  LoadCell.start(3000, true);
+  LoadCell.setCalFactor(calibrationValue);
+
+  savedTareOffset = LoadCell.getTareOffset();
+  saveTareOffset(savedTareOffset);
+
+  tareOffsetReady = true;
+
+  Serial.println("TARE OFFSET SAVED.");
+  Serial.println("Now set FACTORY_TARE_MODE to 0 and upload again.");
+
+#else
+  savedTareOffset = loadTareOffset();
+
+  if (savedTareOffset == 0) {
+    Serial.println("WARNING: No saved tare offset found!");
+    Serial.println("Run once with FACTORY_TARE_MODE 1 using EMPTY bottle.");
+    tareOffsetReady = false;
+  } else {
+    tareOffsetReady = true;
+  }
+
+  LoadCell.start(3000, false);
+
+  if (tareOffsetReady) {
+    LoadCell.setTareOffset(savedTareOffset);
+    Serial.println("Saved tare offset applied.");
+  }
+
+  LoadCell.setCalFactor(calibrationValue);
+
+  previousWeight = loadLastStableWeight();
+#endif
+
+  DateTime now = rtc.now();
+  updateNextReminderTime(now);
+  lastReminderTime = millis();
+  lastRepeatAlertTime = millis();
+  lastSyncAttempt = millis();
+
+  lastMotionTime = millis();
+
+  saveEvent(now, "system_start");
+
+  Serial.println("SYSTEM STARTED - OFFLINE MODE");
+  printNextReminderToSerial();
+
+#if !FACTORY_TARE_MODE
+  syncNow();
+#endif
+}
+
+// =====================================================
+// LOOP
+// =====================================================
+void loop() {
+  DateTime now = rtc.now();
+
+  checkBatteryLow();
+
+#if FACTORY_TARE_MODE
+  if (LoadCell.update()) {
+    float w = LoadCell.getData();
+
+    display.firstPage();
+    do {
+      display.setFont(u8g2_font_6x10_tf);
+      display.setCursor(0, 15);
+      display.print("FACTORY TARE MODE");
+      display.setCursor(0, 30);
+      display.print("Offset saved.");
+      display.setCursor(0, 45);
+      display.print("Weight: ");
+      display.print(w, 1);
+      display.print(" g");
+    } while (display.nextPage());
+
+    Serial.print("Weight: ");
+    Serial.println(w, 1);
+  }
+
+  delay(500);
+  return;
+#endif
+
+  if (!reminderActive && millis() - lastReminderTime >= reminderInterval) {
+    activateReminder(now);
+  }
+
+  if (reminderActive && millis() - lastRepeatAlertTime >= repeatAlertInterval) {
+    Serial.println("Repeat alert: Drink water!");
+
+    reminderAlert();
+
+    saveEvent(now, "repeat_reminder");
+
+    lastRepeatAlertTime = millis();
+  }
+
+  if (drankConfirmed && millis() - drinkLedStartTime >= drinkShowTime) {
+    drankConfirmed = false;
+    clearPixel();
+  }
+
+  if (LoadCell.update()) {
+    float w = LoadCell.getData();
+
+    if (w < 5) {
+      w = 0;
+    }
+
+    currentWeight = w;
+
+    // =================================================
+    // MOTION FILTER
+    // =================================================
+    // Хэрэв дараалсан хэмжилтийн хооронд жин огцом өөрчлөгдвөл
+    // ширээ хөдөлсөн эсвэл сав доргисон гэж үзнэ.
+    if (fabs(w - lastRawWeight) > motionThreshold) {
+      lastMotionTime = millis();
+    }
+
+    lastRawWeight = w;
+
+    bool motionQuiet = (millis() - lastMotionTime >= motionQuietTime);
+
+    // Сав жин дээр байхгүй үед төлөв reset хийнэ.
+    // previousWeight-г шууд 0 болгохгүй.
+    if (w < liftThreshold) {
+      bottleOnScale = false;
+      waitingStable = false;
+    }
+
+    // Сав жин дээр анх тавигдсан үед.
+    if (w >= liftThreshold && !bottleOnScale) {
+      bottleOnScale = true;
+      waitingStable = true;
+      stableTimer = millis();
+      stableReference = w;
+
+      Serial.println("Bottle detected, waiting for stable weight...");
+    }
+
+    // Сав жин дээрээ байгаа үед жин өөрчлөгдвөл шалгана.
+    // Гэхдээ хөдөлгөөн намдаагүй бол шууд уусан гэж тооцохгүй.
+    if (bottleOnScale && !waitingStable && previousWeight > 0 && motionQuiet) {
+      float diff = previousWeight - w;
+
+      // Зөвхөн жин багассан үед боломжит уусан ус гэж үзээд stable шалгалт эхлүүлнэ.
+      if (diff > drinkThreshold && diff < maxDrinkThreshold) {
+        waitingStable = true;
+        stableTimer = millis();
+        stableReference = w;
+
+        Serial.println("Possible drink detected. Waiting for stable weight...");
+      }
+
+      // Жин нэмэгдсэн үед ус нэмсэн гэж үзэж stable update хийнэ.
+      if (diff < -drinkThreshold) {
+        waitingStable = true;
+        stableTimer = millis();
+        stableReference = w;
+
+        Serial.println("Weight increased. Waiting for stable update...");
+      }
+    }
+
+    if (waitingStable) {
+      // Жин stableReference-ээс их савлаж байвал тогтворжих хугацааг дахин эхлүүлнэ.
+      if (fabs(w - stableReference) > stabilityThreshold) {
+        stableReference = w;
+        stableTimer = millis();
+      }
+
+      // Жин хангалттай хугацаанд тогтвортой болсон эсэх.
+      if (millis() - stableTimer >= stableDelay) {
+        waitingStable = false;
+
+        // Boot-ийн эхний stable жинг уусан ус гэж тооцохгүй.
+        if (!bootWeightChecked) {
+          bootWeightChecked = true;
+
+          handleBootStableWeight(stableReference);
+
+        } else {
+          if (previousWeight == 0) {
+            previousWeight = stableReference;
+            saveLastStableWeight(previousWeight);
+
+            Serial.print("Initial stable weight: ");
+            Serial.print(previousWeight, 1);
+            Serial.println(" g");
+
+          } else {
+            float drank = previousWeight - stableReference;
+
+            // Motion намдаагүй бол уусан ус гэж тооцохгүй.
+            if (motionQuiet && drank > drinkThreshold && drank < maxDrinkThreshold) {
+              confirmDrink(now, drank);
+            } else {
+              Serial.println("Ignored unstable or invalid weight change.");
+            }
+
+            previousWeight = stableReference;
+            saveLastStableWeight(previousWeight);
+
+            Serial.print("Stable weight updated: ");
+            Serial.print(previousWeight, 1);
+            Serial.println(" g");
+          }
+        }
+      }
+    }
+
+    drawDisplay(now);
+  }
+
+  tryAutoSync();
+
+  delay(50);
+}
