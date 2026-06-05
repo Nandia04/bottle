@@ -9,8 +9,6 @@ const char* WIFI_PASS = "01234567";
 // =====================================================
 // FACTORY TARE MODE
 // =====================================================
-// Анхны тохиргоо хийх үед 1 болгоод хоосон савтай upload хийнэ.
-// TARE OFFSET хадгалагдсаны дараа 0 болгоод дахин upload хийнэ.
 #define FACTORY_TARE_MODE 0
 
 #include <WiFi.h>
@@ -76,8 +74,16 @@ const unsigned long batteryAlertInterval = 60000UL;
 // ================= Calibration =================
 float calibrationValue = 1050.0;
 
-// ================= USER =================
-float dailyGoal = 2000.0;
+// ================= USER / BLYNK SETTINGS =================
+// V10 = User weight, V11 = User height, V12 = Sleep time
+// Daily goal is calculated automatically from weight: kg * 30 ml.
+float userWeightKg = 60.0;
+float userHeightCm = 155.0;
+String sleepTimeStr = "23:00";
+
+float dailyGoal = 1800.0;
+const float waterMlPerKg = 30.0;
+const int fixedDrinkAmountMl = 150;
 
 // ================= Tracking =================
 float currentWeight = 0.0;
@@ -85,19 +91,24 @@ float previousWeight = 0.0;
 float stableReference = 0.0;
 float lastDrink = 0.0;
 float totalDrink = 0.0;
+int completedDrinks = 0;
+int reminderCount = 0;
+String waterStatus = "Хэвийн";
+String systemStartTimeStr = "--:--";
+String activeDateStr = "";
 
 // ================= Motion Filter =================
-// Ширээ хөдөлсөн, сав доргисон үед ус уусан гэж андуурахаас хамгаална.
 float lastRawWeight = 0.0;
 unsigned long lastMotionTime = 0;
 
-const unsigned long motionQuietTime = 2500UL; 
+const unsigned long motionQuietTime = 2500UL;
 const float motionThreshold = 8.0;
 
 // ================= States =================
 bool bottleOnScale = false;
 bool waitingStable = false;
 bool reminderActive = false;
+bool reminderEnabled = true;
 bool drankConfirmed = false;
 bool dailyGoalNotified = false;
 bool bootWeightChecked = false;
@@ -109,30 +120,25 @@ unsigned long lastReminderTime = 0;
 unsigned long lastRepeatAlertTime = 0;
 unsigned long lastSyncAttempt = 0;
 
+// 3 минут тутам ус уух сануулга өгнө
 const unsigned long reminderInterval    = 3UL * 60UL * 1000UL;
-const unsigned long repeatAlertInterval = 30000UL;
 
-// Өмнө 1500 байсан. Одоо доргилт багасгахын тулд 3000 болгосон.
+// Ус уухгүй бол 30 секундийн дараа дахин сануулна
+const unsigned long repeatAlertInterval = 30UL * 1000UL;
+
 const unsigned long stableDelay         = 3000UL;
-
 const unsigned long drinkShowTime       = 3000UL;
 const unsigned long autoSyncInterval    = 60UL * 60UL * 1000UL;
 
 // ================= Wi-Fi Sync =================
-const unsigned long wifiConnectTimeout = 10000UL;
-const unsigned long blynkConnectTimeout = 5000UL;
+const unsigned long wifiConnectTimeout = 3000UL;
+const unsigned long blynkConnectTimeout = 1200UL;
 
 // ================= Thresholds =================
 const float liftThreshold      = 50.0;
-
-// Өмнө 5g байсан. Одоо ширээний хөдөлгөөнөөс хамгаалж 10g болгосон.
 const float drinkThreshold     = 10.0;
-
 const float maxDrinkThreshold  = 300.0;
-
-// Өмнө 2g байсан. Одоо 4g болгосон.
 const float stabilityThreshold = 4.0;
-
 const float bootWeightDifferenceThreshold = 5.0;
 
 // ================= Time =================
@@ -144,9 +150,17 @@ float prevSentWeight = -9999.0;
 float prevSentLastDrink = -9999.0;
 float prevSentTotalDrink = -9999.0;
 float prevSentDailyGoal = -9999.0;
-int prevSentReminderActive = -1;
-int prevSentDrankConfirmed = -1;
+int prevSentReminderEnabled = -1;
+int prevSentCompletedDrinks = -1;
 String prevSentNextTime = "";
+String prevSentWaterStatus = "";
+int prevSentReminderCount = -1;
+float prevSentSuccessRate = -9999.0;
+float prevSentUserWeight = -9999.0;
+float prevSentUserHeight = -9999.0;
+String prevSentSleepTime = "";
+String prevSentSystemStartTime = "";
+String prevSentSdStatus = "";
 
 // =====================================================
 // STRING HELPERS
@@ -203,6 +217,140 @@ long loadTareOffset() {
   Serial.println(offset);
 
   return offset;
+}
+
+// =====================================================
+// USER SETTINGS SAVE / LOAD
+// =====================================================
+void calculateDailyGoal() {
+  if (userWeightKg < 30.0) userWeightKg = 30.0;
+  if (userWeightKg > 150.0) userWeightKg = 150.0;
+
+  dailyGoal = userWeightKg * waterMlPerKg;
+}
+
+float calculateSuccessRate() {
+  if (dailyGoal <= 0.0) return 0.0;
+
+  float rate = (totalDrink / dailyGoal) * 100.0;
+
+  if (rate < 0.0) rate = 0.0;
+  if (rate > 100.0) rate = 100.0;
+
+  return rate;
+}
+
+String getNextReminderString() {
+  String nextTime = "";
+
+  if (nextReminderHour < 10) nextTime += "0";
+  nextTime += String(nextReminderHour);
+  nextTime += ":";
+
+  if (nextReminderMinute < 10) nextTime += "0";
+  nextTime += String(nextReminderMinute);
+
+  return nextTime;
+}
+
+void saveUserSettings() {
+  prefs.putFloat("uWeight", userWeightKg);
+  prefs.putFloat("uHeight", userHeightCm);
+  prefs.putString("sleepTime", sleepTimeStr);
+  prefs.putBool("remEn", reminderEnabled);
+
+  Serial.println("User settings saved.");
+}
+
+void loadUserSettings() {
+  userWeightKg = prefs.getFloat("uWeight", 60.0);
+  userHeightCm = prefs.getFloat("uHeight", 155.0);
+  sleepTimeStr = prefs.getString("sleepTime", "23:00");
+  reminderEnabled = prefs.getBool("remEn", true);
+
+  calculateDailyGoal();
+
+  Serial.print("User weight: ");
+  Serial.print(userWeightKg, 1);
+  Serial.println(" kg");
+
+  Serial.print("User height: ");
+  Serial.print(userHeightCm, 1);
+  Serial.println(" cm");
+
+  Serial.print("Sleep time: ");
+  Serial.println(sleepTimeStr);
+
+  Serial.print("Daily goal: ");
+  Serial.print(dailyGoal, 0);
+  Serial.println(" ml");
+}
+
+void saveTodayCounters() {
+  if (activeDateStr.length() == 0) {
+    DateTime now = rtc.now();
+    activeDateStr = getDateString(now);
+  }
+
+  prefs.putString("todayDate", activeDateStr);
+  prefs.putFloat("totalDrink", totalDrink);
+  prefs.putFloat("lastDrink", lastDrink);
+  prefs.putInt("completed", completedDrinks);
+  prefs.putInt("remCount", reminderCount);
+  prefs.putBool("goalDone", dailyGoalNotified);
+}
+
+void resetTodayCounters(DateTime now) {
+  activeDateStr = getDateString(now);
+
+  totalDrink = 0.0;
+  lastDrink = 0.0;
+  completedDrinks = 0;
+  reminderCount = 0;
+  dailyGoalNotified = false;
+
+  reminderActive = false;
+  drankConfirmed = false;
+  waterStatus = "Шинэ өдөр эхэлсэн";
+
+  lastReminderTime = millis();
+  lastRepeatAlertTime = millis();
+
+  updateNextReminderTime(now);
+  saveTodayCounters();
+
+  Serial.println("NEW DAY DETECTED - TODAY COUNTERS RESET");
+}
+
+void loadTodayCounters() {
+  DateTime now = rtc.now();
+  String today = getDateString(now);
+  String savedDate = prefs.getString("todayDate", "");
+
+  if (savedDate != today) {
+    resetTodayCounters(now);
+    return;
+  }
+
+  activeDateStr = savedDate;
+
+  totalDrink = prefs.getFloat("totalDrink", 0.0);
+  lastDrink = prefs.getFloat("lastDrink", 0.0);
+  completedDrinks = prefs.getInt("completed", 0);
+  reminderCount = prefs.getInt("remCount", 0);
+  dailyGoalNotified = prefs.getBool("goalDone", false);
+}
+
+void checkNewDay(DateTime now) {
+  String today = getDateString(now);
+
+  if (activeDateStr.length() == 0) {
+    activeDateStr = prefs.getString("todayDate", today);
+  }
+
+  if (activeDateStr != today) {
+    resetTodayCounters(now);
+  }
 }
 
 // =====================================================
@@ -318,7 +466,11 @@ void reminderAlert() {
 }
 
 void drinkConfirmedLed() {
-  flashLED(0, 0, 255, 2, 180, 180, false);
+  // Ус уусны дараа ногоон гэрэл асаж, 2 удаа beep дуугарна.
+  setPixelColorRGB(0, 255, 0);
+  beepOnce(2200, 120);
+  delay(120);
+  beepOnce(2200, 120);
 }
 
 void batteryLowAlert() {
@@ -374,17 +526,13 @@ void checkBatteryLow() {
 // TIME
 // =====================================================
 void updateNextReminderTime(DateTime now) {
-  nextReminderHour = now.hour();
-  nextReminderMinute = now.minute() + 3;
+  int intervalMin = reminderInterval / 60000UL;
 
-  if (nextReminderMinute >= 60) {
-    nextReminderMinute -= 60;
-    nextReminderHour++;
-  }
+  int totalMin = now.hour() * 60 + now.minute() + intervalMin;
+  totalMin = totalMin % (24 * 60);
 
-  if (nextReminderHour >= 24) {
-    nextReminderHour = 0;
-  }
+  nextReminderHour = totalMin / 60;
+  nextReminderMinute = totalMin % 60;
 }
 
 void printNextReminderToSerial() {
@@ -401,6 +549,7 @@ void printNextReminderToSerial() {
 // =====================================================
 void drawDisplay(DateTime now) {
   display.firstPage();
+
   do {
     display.setFont(u8g2_font_6x10_tf);
 
@@ -444,17 +593,15 @@ void drawDisplay(DateTime now) {
 }
 
 // =====================================================
-// BLYNK SEND
+// BLYNK SEND / RECEIVE
 // =====================================================
 void sendToBlynkIfChanged(bool forceSend = false) {
   if (WiFi.status() != WL_CONNECTED || !Blynk.connected()) return;
 
-  String nextTime = "";
-  if (nextReminderHour < 10) nextTime += "0";
-  nextTime += String(nextReminderHour);
-  nextTime += ":";
-  if (nextReminderMinute < 10) nextTime += "0";
-  nextTime += String(nextReminderMinute);
+  String nextTime = getNextReminderString();
+  float successRate = calculateSuccessRate();
+  String sdStatus = sdReady ? "SD card OK" : "SD card алдаа";
+  String systemStartTime = systemStartTimeStr;
 
   if (forceSend || fabs(currentWeight - prevSentWeight) > 1.0) {
     Blynk.virtualWrite(V0, currentWeight);
@@ -476,26 +623,135 @@ void sendToBlynkIfChanged(bool forceSend = false) {
     prevSentDailyGoal = dailyGoal;
   }
 
-  int reminderState = reminderActive ? 1 : 0;
-  if (forceSend || reminderState != prevSentReminderActive) {
-    Blynk.virtualWrite(V4, reminderState);
-    prevSentReminderActive = reminderState;
+  int reminderEnabledState = reminderEnabled ? 1 : 0;
+  if (forceSend || reminderEnabledState != prevSentReminderEnabled) {
+    Blynk.virtualWrite(V4, reminderEnabledState);
+    prevSentReminderEnabled = reminderEnabledState;
   }
 
-  int drankState = drankConfirmed ? 1 : 0;
-  if (forceSend || drankState != prevSentDrankConfirmed) {
-    Blynk.virtualWrite(V5, drankState);
-    prevSentDrankConfirmed = drankState;
+  if (forceSend || completedDrinks != prevSentCompletedDrinks) {
+    Blynk.virtualWrite(V5, completedDrinks);
+    prevSentCompletedDrinks = completedDrinks;
   }
 
   if (forceSend || nextTime != prevSentNextTime) {
     Blynk.virtualWrite(V6, nextTime);
     prevSentNextTime = nextTime;
   }
+
+  if (forceSend || waterStatus != prevSentWaterStatus) {
+    Blynk.virtualWrite(V7, waterStatus);
+    prevSentWaterStatus = waterStatus;
+  }
+
+  if (forceSend || reminderCount != prevSentReminderCount) {
+    Blynk.virtualWrite(V8, reminderCount);
+    prevSentReminderCount = reminderCount;
+  }
+
+  if (forceSend || fabs(successRate - prevSentSuccessRate) > 0.5) {
+    Blynk.virtualWrite(V9, successRate);
+    prevSentSuccessRate = successRate;
+  }
+
+  if (forceSend || fabs(userWeightKg - prevSentUserWeight) > 0.1) {
+    Blynk.virtualWrite(V10, userWeightKg);
+    prevSentUserWeight = userWeightKg;
+  }
+
+  if (forceSend || fabs(userHeightCm - prevSentUserHeight) > 0.1) {
+    Blynk.virtualWrite(V11, userHeightCm);
+    prevSentUserHeight = userHeightCm;
+  }
+
+  if (forceSend || sleepTimeStr != prevSentSleepTime) {
+    Blynk.virtualWrite(V12, sleepTimeStr);
+    prevSentSleepTime = sleepTimeStr;
+  }
+
+  if (forceSend || systemStartTime != prevSentSystemStartTime) {
+    Blynk.virtualWrite(V14, systemStartTime);
+    prevSentSystemStartTime = systemStartTime;
+  }
+
+  if (forceSend || sdStatus != prevSentSdStatus) {
+    Blynk.virtualWrite(V15, sdStatus);
+    prevSentSdStatus = sdStatus;
+  }
 }
 
+BLYNK_CONNECTED() {
+  Serial.println("BLYNK_CONNECTED");
+  Blynk.syncVirtual(V4, V10, V11, V12);
+  sendToBlynkIfChanged(true);
+}
+
+// V4 = Сануулагч ON/OFF
+BLYNK_WRITE(V4) {
+  reminderEnabled = param.asInt() == 1;
+  saveUserSettings();
+
+  if (!reminderEnabled) {
+    reminderActive = false;
+    clearPixel();
+    buzzerOff();
+    waterStatus = "Сануулагч унтарсан";
+  } else {
+    waterStatus = "Хэвийн";
+  }
+
+  sendToBlynkIfChanged(true);
+}
+
+// V10 = Биеийн жин. Үүнээс V3 Daily goal автоматаар бодогдоно.
 BLYNK_WRITE(V10) {
-  dailyGoal = param.asFloat();
+  float v = param.asFloat();
+
+  if (v >= 30.0 && v <= 150.0) {
+    userWeightKg = v;
+    calculateDailyGoal();
+    saveUserSettings();
+
+    Serial.print("Blynk weight updated: ");
+    Serial.print(userWeightKg, 1);
+    Serial.print(" kg, daily goal: ");
+    Serial.print(dailyGoal, 0);
+    Serial.println(" ml");
+
+    sendToBlynkIfChanged(true);
+  }
+}
+
+// V11 = Өндөр. Одоогоор өдөр тутмын зорилго жингээр бодогдоно.
+// Өндрийг хэрэглэгчийн мэдээлэл болгож хадгална.
+BLYNK_WRITE(V11) {
+  float v = param.asFloat();
+
+  if (v >= 50.0 && v <= 250.0) {
+    userHeightCm = v;
+    saveUserSettings();
+
+    Serial.print("Blynk height updated: ");
+    Serial.print(userHeightCm, 1);
+    Serial.println(" cm");
+
+    sendToBlynkIfChanged(true);
+  }
+}
+
+// V12 = Унтах цаг. Жишээ: "23:00"
+BLYNK_WRITE(V12) {
+  sleepTimeStr = param.asString();
+
+  if (sleepTimeStr.length() == 0) {
+    sleepTimeStr = "23:00";
+  }
+
+  saveUserSettings();
+
+  Serial.print("Blynk sleep time updated: ");
+  Serial.println(sleepTimeStr);
+
   sendToBlynkIfChanged(true);
 }
 
@@ -514,6 +770,7 @@ bool postHistoryArray(const String &pin, const String &jsonArray) {
 
   int httpCode = http.POST(jsonArray);
   String response = http.getString();
+
   http.end();
 
   Serial.print("POST ");
@@ -552,6 +809,7 @@ bool syncPendingToBlynk() {
   while (file.available() && count < maxBatch) {
     String line = file.readStringUntil('\n');
     line.trim();
+
     if (line.length() == 0) continue;
 
     int p1 = line.indexOf(',');
@@ -614,9 +872,11 @@ bool syncPendingToBlynk() {
   outFile.println(firstLine);
 
   int skipped = 0;
+
   while (inFile.available()) {
     String line = inFile.readStringUntil('\n');
     line.trim();
+
     if (line.length() == 0) continue;
 
     if (skipped < count) {
@@ -669,14 +929,8 @@ void syncAllPendingToBlynk() {
 // WIFI CONTROL
 // =====================================================
 void wifiOff() {
-  if (Blynk.connected()) {
-    Blynk.disconnect();
-  }
-
-  WiFi.disconnect(true);
-  WiFi.mode(WIFI_OFF);
-  delay(100);
-  Serial.println("WiFi OFF");
+  // Wi-Fi-г кодоор унтраахгүй.
+  Serial.println("wifiOff() skipped: WiFi kept ON");
 }
 
 bool connectWifi() {
@@ -686,11 +940,18 @@ bool connectWifi() {
   }
 
   WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
+  WiFi.setAutoReconnect(true);
+  WiFi.persistent(false);
+
+  if (WiFi.status() == WL_CONNECTED) return true;
+
   WiFi.begin(WIFI_SSID, WIFI_PASS);
 
   Serial.print("Connecting WiFi");
 
   unsigned long startAttempt = millis();
+
   while (WiFi.status() != WL_CONNECTED && millis() - startAttempt < wifiConnectTimeout) {
     delay(250);
     Serial.print(".");
@@ -714,6 +975,7 @@ bool connectBlynk() {
   Blynk.config(BLYNK_AUTH_TOKEN);
 
   unsigned long startAttempt = millis();
+
   while (!Blynk.connected() && millis() - startAttempt < blynkConnectTimeout) {
     Blynk.connect(500);
     Blynk.run();
@@ -729,20 +991,45 @@ bool connectBlynk() {
   return false;
 }
 
+void maintainBlynkConnection() {
+  static unsigned long lastReconnectTry = 0;
+  const unsigned long reconnectInterval = 5000UL;
+
+  if (millis() - lastReconnectTry < reconnectInterval) return;
+
+  lastReconnectTry = millis();
+
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("WiFi disconnected. Reconnecting...");
+    connectWifi();
+    return;
+  }
+
+  if (!Blynk.connected()) {
+    Serial.println("Blynk disconnected. Reconnecting...");
+    connectBlynk();
+    return;
+  }
+
+  Blynk.run();
+}
+
 void syncNow() {
   Serial.println("SYNC START");
 
   bool wifiOK = connectWifi();
+
   if (!wifiOK) {
     syncFailedLed();
-    wifiOff();
+    waterStatus = "Offline - SD хадгалж байна";
     return;
   }
 
   bool blynkOK = connectBlynk();
+
   if (!blynkOK) {
     syncFailedLed();
-    wifiOff();
+    waterStatus = "Blynk холбогдоогүй";
     return;
   }
 
@@ -750,15 +1037,22 @@ void syncNow() {
   syncAllPendingToBlynk();
 
   syncSuccessLed();
-  wifiOff();
+  waterStatus = "Хэвийн";
 
   Serial.println("SYNC DONE");
 }
 
 void tryAutoSync() {
-  if (millis() - lastSyncAttempt < autoSyncInterval) return;
-  lastSyncAttempt = millis();
+  maintainBlynkConnection();
 
+  if (Blynk.connected()) {
+    Blynk.run();
+    sendToBlynkIfChanged();
+  }
+
+  if (millis() - lastSyncAttempt < autoSyncInterval) return;
+
+  lastSyncAttempt = millis();
   syncNow();
 }
 
@@ -773,8 +1067,12 @@ void saveEvent(DateTime now, const String &eventType) {
 // REMINDER
 // =====================================================
 void activateReminder(DateTime now) {
+  if (!reminderEnabled) return;
+
   reminderActive = true;
   drankConfirmed = false;
+  reminderCount++;
+  waterStatus = "Сануулах цаг болсон";
 
   updateNextReminderTime(now);
 
@@ -784,6 +1082,8 @@ void activateReminder(DateTime now) {
   reminderAlert();
 
   saveEvent(now, "reminder");
+  saveTodayCounters();
+  sendToBlynkIfChanged(true);
 
   lastRepeatAlertTime = millis();
 }
@@ -794,6 +1094,8 @@ void activateReminder(DateTime now) {
 void confirmDrink(DateTime now, float drank) {
   lastDrink = drank;
   totalDrink += drank;
+  completedDrinks++;
+  waterStatus = "Ус уусан";
 
   reminderActive = false;
   drankConfirmed = true;
@@ -812,11 +1114,15 @@ void confirmDrink(DateTime now, float drank) {
   drinkConfirmedLed();
 
   saveEvent(now, "drink");
+  saveTodayCounters();
+  sendToBlynkIfChanged(true);
 
   if (totalDrink >= dailyGoal && !dailyGoalNotified) {
     dailyGoalNotified = true;
+    waterStatus = "Өдрийн зорилго биелсэн";
     goalCompletedLed();
     saveEvent(now, "goal_completed");
+    sendToBlynkIfChanged(true);
   }
 }
 
@@ -877,11 +1183,15 @@ void setup() {
 
   prefs.begin("bottle", false);
 
+  loadUserSettings();
+
   initSDCard();
 
   if (!rtc.begin()) {
     Serial.println("RTC NOT FOUND");
   }
+
+  loadTodayCounters();
 
   display.begin();
 
@@ -943,20 +1253,27 @@ void setup() {
 #endif
 
   DateTime now = rtc.now();
+  systemStartTimeStr = twoDigit(now.hour()) + ":" + twoDigit(now.minute());
+
   updateNextReminderTime(now);
+
   lastReminderTime = millis();
   lastRepeatAlertTime = millis();
   lastSyncAttempt = millis();
-
   lastMotionTime = millis();
 
   saveEvent(now, "system_start");
+  waterStatus = "Систем эхэлсэн";
 
   Serial.println("SYSTEM STARTED - OFFLINE MODE");
   printNextReminderToSerial();
 
 #if !FACTORY_TARE_MODE
-  syncNow();
+  // Эхлэх үед Wi-Fi/Blynk холболтыг богино хугацаанд л оролдоно.
+  // Холбогдохгүй байсан ч систем шууд offline горимоор жин хэмжиж эхэлнэ.
+  connectWifi();
+  connectBlynk();
+  sendToBlynkIfChanged(true);
 #endif
 }
 
@@ -966,6 +1283,8 @@ void setup() {
 void loop() {
   DateTime now = rtc.now();
 
+  checkNewDay(now);
+
   checkBatteryLow();
 
 #if FACTORY_TARE_MODE
@@ -973,16 +1292,20 @@ void loop() {
     float w = LoadCell.getData();
 
     display.firstPage();
+
     do {
       display.setFont(u8g2_font_6x10_tf);
       display.setCursor(0, 15);
       display.print("FACTORY TARE MODE");
+
       display.setCursor(0, 30);
       display.print("Offset saved.");
+
       display.setCursor(0, 45);
       display.print("Weight: ");
       display.print(w, 1);
       display.print(" g");
+
     } while (display.nextPage());
 
     Serial.print("Weight: ");
@@ -993,23 +1316,30 @@ void loop() {
   return;
 #endif
 
-  if (!reminderActive && millis() - lastReminderTime >= reminderInterval) {
+  if (reminderEnabled && !reminderActive && millis() - lastReminderTime >= reminderInterval) {
     activateReminder(now);
   }
 
-  if (reminderActive && millis() - lastRepeatAlertTime >= repeatAlertInterval) {
+  if (reminderEnabled && reminderActive && millis() - lastRepeatAlertTime >= repeatAlertInterval) {
     Serial.println("Repeat alert: Drink water!");
 
     reminderAlert();
 
+    reminderCount++;
+    waterStatus = "Дахин сануулсан";
+
     saveEvent(now, "repeat_reminder");
+    saveTodayCounters();
+    sendToBlynkIfChanged(true);
 
     lastRepeatAlertTime = millis();
   }
 
   if (drankConfirmed && millis() - drinkLedStartTime >= drinkShowTime) {
     drankConfirmed = false;
+    waterStatus = "Хэвийн";
     clearPixel();
+    sendToBlynkIfChanged(true);
   }
 
   if (LoadCell.update()) {
@@ -1024,8 +1354,6 @@ void loop() {
     // =================================================
     // MOTION FILTER
     // =================================================
-    // Хэрэв дараалсан хэмжилтийн хооронд жин огцом өөрчлөгдвөл
-    // ширээ хөдөлсөн эсвэл сав доргисон гэж үзнэ.
     if (fabs(w - lastRawWeight) > motionThreshold) {
       lastMotionTime = millis();
     }
@@ -1089,9 +1417,7 @@ void loop() {
         // Boot-ийн эхний stable жинг уусан ус гэж тооцохгүй.
         if (!bootWeightChecked) {
           bootWeightChecked = true;
-
           handleBootStableWeight(stableReference);
-
         } else {
           if (previousWeight == 0) {
             previousWeight = stableReference;
@@ -1100,7 +1426,6 @@ void loop() {
             Serial.print("Initial stable weight: ");
             Serial.print(previousWeight, 1);
             Serial.println(" g");
-
           } else {
             float drank = previousWeight - stableReference;
 
@@ -1125,6 +1450,8 @@ void loop() {
     drawDisplay(now);
   }
 
+  // Wi-Fi/Blynk ажиллагаа хамгийн сүүлд хийгдэнэ.
+  // Холболтгүй байсан ч дээрх жин хэмжилт, сануулга, SD хадгалалт ажилласан хэвээр байна.
   tryAutoSync();
 
   delay(50);
